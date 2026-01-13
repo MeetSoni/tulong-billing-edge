@@ -1,32 +1,45 @@
-// supabase/functions/create-checkout-session/index.ts
-
-import Stripe from "npm:stripe@14.21.0";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// ---------- CORS helpers ----------
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-Deno.serve(async (req) => {
-  // 0) Handle preflight (Bubble browser requests)
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+function formEncode(data: Record<string, string>) {
+  return new URLSearchParams(data).toString();
+}
+
+async function stripePost(path: string, body: Record<string, string>) {
+  const secret = Deno.env.get("STRIPE_SECRET_KEY");
+  if (!secret) throw new Error("Missing STRIPE_SECRET_KEY");
+
+  const res = await fetch(`https://api.stripe.com/v1${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${secret}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: formEncode(body),
+  });
+
+  const json = await res.json();
+  if (!res.ok) {
+    throw new Error(`Stripe error: ${JSON.stringify(json)}`);
   }
+  return json;
+}
+
+Deno.serve(async (req) => {
+  // Preflight
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
-    // 1) Allow only POST
     if (req.method !== "POST") {
-      return new Response("Method not allowed", {
-        status: 405,
-        headers: corsHeaders,
-      });
+      return new Response("Method not allowed", { status: 405, headers: corsHeaders });
     }
 
-    // 2) Read Authorization header (Supabase access token)
+    // 1) Read JWT
     const authHeader = req.headers.get("Authorization") ?? "";
     if (!authHeader.startsWith("Bearer ")) {
       return new Response(JSON.stringify({ error: "Missing Authorization header" }), {
@@ -36,27 +49,25 @@ Deno.serve(async (req) => {
     }
     const jwt = authHeader.slice("Bearer ".length).trim();
 
-    // 3) Create Supabase admin client (service role)
-    const supabaseAdmin = createClient(
+    // 2) Supabase admin client
+    const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
       { auth: { persistSession: false } }
     );
 
-    // 4) Validate the JWT and fetch user
-    const { data: userRes, error: userErr } = await supabaseAdmin.auth.getUser(jwt);
+    // 3) Validate token
+    const { data: userRes, error: userErr } = await supabase.auth.getUser(jwt);
     if (userErr || !userRes?.user) {
       return new Response(JSON.stringify({ error: "Invalid token", details: userErr?.message }), {
         status: 401,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
-
     const user = userRes.user;
 
-    // 5) Read body
+    // 4) Parse request body
     const { price_id, success_url, cancel_url } = await req.json();
-
     if (!price_id) {
       return new Response(JSON.stringify({ error: "price_id is required" }), {
         status: 400,
@@ -64,70 +75,48 @@ Deno.serve(async (req) => {
       });
     }
 
-    // 6) Create Stripe client using fetch httpClient (IMPORTANT for Edge runtime)
-    const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, {
-      apiVersion: "2023-10-16",
-      httpClient: Stripe.createFetchHttpClient(),
-    });
-
-    // 7) Find Stripe customer in your DB
-    // ✅ IMPORTANT: use user_id (not id) if your table is billing_customers(user_id, stripe_customer_id)
-    const { data: existing, error: existingErr } = await supabaseAdmin
+    // 5) Find stripe customer in DB
+    const { data: existing, error: exErr } = await supabase
       .from("billing_customers")
       .select("stripe_customer_id")
       .eq("user_id", user.id)
       .maybeSingle();
 
-    if (existingErr) {
-      return new Response(JSON.stringify({ error: "DB error", details: existingErr.message }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    if (exErr) throw new Error(exErr.message);
 
-    let stripeCustomerId = existing?.stripe_customer_id ?? null;
+    let stripeCustomerId = existing?.stripe_customer_id as string | undefined;
 
-    // 8) Create customer if not exists
+    // 6) Create customer if not exists (Stripe REST)
     if (!stripeCustomerId) {
-      const customer = await stripe.customers.create({
-        email: user.email ?? undefined,
-        metadata: { user_id: user.id },
+      const customer = await stripePost("/customers", {
+        email: user.email ?? "",
+        [`metadata[user_id]`]: user.id,
       });
 
       stripeCustomerId = customer.id;
 
-      // Upsert into billing_customers
-      const { error: upsertErr } = await supabaseAdmin
+      const { error: upErr } = await supabase
         .from("billing_customers")
-        .upsert({
-          user_id: user.id,
-          stripe_customer_id: stripeCustomerId,
-        });
+        .upsert({ user_id: user.id, stripe_customer_id: stripeCustomerId });
 
-      if (upsertErr) {
-        return new Response(JSON.stringify({ error: "DB upsert error", details: upsertErr.message }), {
-          status: 500,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+      if (upErr) throw new Error(upErr.message);
     }
 
-    // 9) Create checkout session
-    const session = await stripe.checkout.sessions.create({
+    // 7) Create checkout session (Stripe REST)
+    const session = await stripePost("/checkout/sessions", {
       mode: "subscription",
       customer: stripeCustomerId,
-      line_items: [{ price: price_id, quantity: 1 }],
+      "line_items[0][price]": price_id,
+      "line_items[0][quantity]": "1",
       success_url: success_url ?? "https://tulongmedia.tech/account?checkout=success",
       cancel_url: cancel_url ?? "https://tulongmedia.tech/pricing?checkout=cancel",
-      metadata: { user_id: user.id },
+      [`metadata[user_id]`]: user.id,
     });
 
-    // 10) Return URL
     return new Response(JSON.stringify({ url: session.url }), {
       status: 200,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
-
   } catch (e) {
     return new Response(JSON.stringify({ error: String(e) }), {
       status: 500,
